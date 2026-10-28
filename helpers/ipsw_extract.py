@@ -216,37 +216,74 @@ def extract_sandbox_kext(kernelcache, out_dir, kext):
     return kext_path
 
 
-def native_extract(kext_path, ops_path, bundle_dir, release):
-    """Run SandBlaster's native extractor on the sandbox KEXT.
+def major_version(release):
+    """Return the major iOS version of a release string such as ``27.2``."""
+    try:
+        return int(str(release).split(".")[0])
+    except ValueError:
+        eprint("error: could not parse an iOS major version from %r" % release)
+        sys.exit(2)
 
-    ``extract_sandbox_data.py`` parses the KEXT Mach-O with ``lief`` and writes
-    the operations list (``-o``) and the sandbox profile collection (``-O``,
-    produced as a file named ``sandbox_bundle`` for iOS 9+). This is
-    SandBlaster's own understanding of the sandbox binary format; ipsw is used
-    only to obtain the KEXT.
+
+def native_extract(kext_path, ops_path, bundle_dir, release):
+    """Run SandBlaster's native extraction on the sandbox KEXT.
+
+    Two extractors exist, picked by release:
+
+      * iOS <= 14 -- ``extract_sandbox_data.py`` reads both the operations
+        list and the profile collection out of the KEXT.
+      * iOS 15+ -- the KEXT's pointers are chained fixups, which the legacy
+        extractor cannot follow, so ``extract_sandbox_modern.py`` recovers the
+        operations list. The compiled collection on these releases no longer
+        uses the iOS 13/14 bundle header, so collection extraction is attempted
+        but is expected to fail; the operations list is still produced.
 
     Args:
         kext_path: path to the extracted sandbox KEXT.
         ops_path: path to write the ``.sb_ops`` operations list to.
         bundle_dir: directory the ``sandbox_bundle`` collection is written to.
-        release: iOS release string (e.g. ``27.2``); its major version selects
-            the extraction logic.
+        release: iOS release string (e.g. ``27.2``).
+
+    Returns:
+        The path to the extracted collection, or None when it could not be
+        extracted (modern releases).
     """
     here = os.path.dirname(os.path.abspath(__file__))
-    extractor = os.path.join(here, "extract_sandbox_data.py")
-    cmd = [sys.executable, extractor,
-           "-o", ops_path,
-           "-O", bundle_dir,
-           kext_path, release]
+    legacy = os.path.join(here, "extract_sandbox_data.py")
+    modern = os.path.join(here, "extract_sandbox_modern.py")
+    bundle_path = os.path.join(bundle_dir, "sandbox_bundle")
+
+    if major_version(release) >= 15:
+        # Operations: chained-fixup aware extractor.
+        cmd = [sys.executable, modern, "-o", ops_path, kext_path]
+        eprint("+ " + " ".join(cmd))
+        subprocess.run(cmd, check=True)
+
+        # Collection: not supported on modern releases. Attempt it anyway in
+        # case a release reverts to the legacy layout, but swallow the
+        # extractor's traceback -- failure is the expected outcome here and the
+        # note below explains it.
+        cmd = [sys.executable, legacy, "-O", bundle_dir, kext_path, release]
+        eprint("+ " + " ".join(cmd))
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        if result.returncode != 0 or not os.path.isfile(bundle_path):
+            eprint("")
+            eprint("note: recovered the operations list, but could NOT extract "
+                   "the sandbox profile collection.")
+            eprint("      On iOS 15+ the compiled collection in the KEXT no "
+                   "longer uses the iOS 13/14 0x8000 bundle header, so")
+            eprint("      reverse_sandbox.py cannot consume it yet. See the "
+                   "README (\"Supported iOS Versions\").")
+            return None
+        return bundle_path
+
+    cmd = [sys.executable, legacy,
+           "-o", ops_path, "-O", bundle_dir, kext_path, release]
     eprint("+ " + " ".join(cmd))
     subprocess.run(cmd, check=True)
-
-    bundle_path = os.path.join(bundle_dir, "sandbox_bundle")
     if not os.path.isfile(bundle_path):
         eprint("error: the extractor did not produce %s" % bundle_path)
-        eprint("       on modern firmware the collection may be in the newer "
-               "\"protobox\" format that the native extractor does not parse "
-               "yet.")
         sys.exit(1)
     eprint("wrote operations to %s and collection to %s"
            % (ops_path, bundle_path))
@@ -341,6 +378,12 @@ def main():
 
     ops_path = os.path.join(args.output, args.prefix + ".sb_ops")
     bundle_path = native_extract(kext_path, ops_path, args.output, release)
+
+    if bundle_path is None:
+        eprint("")
+        eprint("operations list: %s" % os.path.abspath(ops_path))
+        eprint("stopping before reversing: no collection was extracted.")
+        sys.exit(1)
 
     if args.reverse:
         reverse(bundle_path, ops_path,

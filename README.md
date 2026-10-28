@@ -25,8 +25,15 @@ different needs:
     brew install blacktop/tap/ipsw
     # Linux: see https://github.com/blacktop/ipsw#install
     ```
-  * `helpers/extract_sandbox_data.py` (legacy path, iOS ≤ 12) parses Mach-O
-    binaries directly with `lief`:
+    Note that `go install github.com/blacktop/ipsw/cmd/ipsw@latest` does *not*
+    work (the module uses `replace` directives). To build from source instead:
+    ```
+    git clone --depth 1 https://github.com/blacktop/ipsw && cd ipsw
+    CGO_ENABLED=1 go build -o ipsw ./cmd/ipsw
+    ```
+  * `helpers/extract_sandbox_data.py` (legacy path, iOS ≤ 14) and
+    `helpers/extract_sandbox_modern.py` (iOS 15+) parse Mach-O binaries
+    directly with `lief`:
     ```
     pip3 install lief
     ```
@@ -71,17 +78,19 @@ the extracted `out/sandbox_bundle` and `out/sandbox.sb_ops`.
 The kernel download, remote extraction and KEXT extraction steps are validated
 against real firmware (e.g. iOS 17.0).
 
-> **Known limitation on iOS 15+ (including iOS 27.2):** the *native extractor
-> and reverser do not yet understand the modern sandbox collection.* SandBlaster
-> was built for the iOS 9–14 bundle format; on iOS 15+ the sandbox KEXT is an
-> arm64e Mach-O whose operation table is stored as chained-fixup pointers, and
-> the profile collection is Apple's newer *protobox* layout rather than the
-> classic `0x8000` bundle. `extract_sandbox_data.py` therefore cannot currently
-> recover the operations list or the collection from an iOS 15+ KEXT, so the
-> end-to-end native pipeline stops at extraction for those releases. The ipsw
-> acquisition front-end above still works; reversing modern collections needs
-> the protobox format and chained-fixup handling to be implemented (see the
-> "Supported iOS Versions" section).
+On iOS 15+ the script automatically uses `extract_sandbox_modern.py` for the
+operations list, since the modern KEXT stores its operation table as chained
+fixups. You can also run that step on its own against an extracted KEXT:
+
+```
+./extract_sandbox_modern.py -o ios27.sb_ops com.apple.security.sandbox
+```
+
+> **Known limitation on iOS 15+ (including iOS 27.2):** the operations list is
+> recovered correctly, but the *compiled profile collection* in the modern KEXT
+> no longer uses the iOS 13/14 `0x8000` bundle header, so `reverse_sandbox.py`
+> cannot consume it yet and the pipeline stops before reversing. See
+> "Supported iOS Versions" below for exactly what is and is not solved.
 
 ### Legacy firmware (iOS ≤ 12)
 
@@ -157,31 +166,37 @@ stored in a bundle, since iOS 10 strings are aggregated together in a
 specialized binary format, and iOS 13 reworked the collection header. The
 format has been validated up to **iOS 14**.
 
-iOS 15 through **iOS 27** are **partially** supported:
+iOS 15 through **iOS 27** are **partially** supported. Two things changed in
+the sandbox KEXT on modern firmware, and only the first is solved:
 
-  * **Acquisition works.** `helpers/ipsw_extract.py` uses `ipsw` to download or
-    remotely extract the kernelcache and carve out the
-    `com.apple.security.sandbox` KEXT. This is validated against real firmware.
-  * **Native extraction/reversing does not work yet.** Starting around iOS 15,
-    the sandbox KEXT is an arm64e Mach-O whose operation-name table is stored
-    as chained-fixup pointers (so SandBlaster's plain-pointer table scan finds
-    nothing), and the compiled profile collection uses Apple's newer *protobox*
-    layout instead of the classic `0x8000` bundle. `extract_sandbox_data.py`
-    and `reverse_sandbox.py` were written for the iOS 9–14 format and do not
-    recognize either of these yet.
+  1. **Operation table → chained fixups. (Solved.)** The sandbox KEXT carved
+     out of a modern fileset kernelcache is an arm64e Mach-O whose pointers are
+     stored as chained fixups, so SandBlaster's plain-pointer table scan found
+     nothing. `helpers/extract_sandbox_modern.py` now recovers the ordered
+     operations list by decoding the kernelcache rebase encoding
+     (`target = base + (raw & 0x3FFFFFFF)`). The kernelcache base is *solved
+     for* rather than hardcoded — it differs per device/release — by finding
+     the base that makes the most pointer words resolve to `__cstring`.
+     Validated against real firmware: **iOS 27.2** (iPhone16,1, build 24B119,
+     base `0xfffffff007004000`, 210 operations) and **iOS 17.0** (iPhone15,2,
+     base `0xfffffff027004000`, 194 operations).
+  2. **Profile collection layout. (Not solved.)** The compiled collection in
+     the KEXT no longer starts with the iOS 13/14 `0x8000` bundle header, and
+     its header fields are not where `reverse_sandbox.py` expects them, so the
+     collection cannot be handed to the reverser yet.
 
-Making iOS 15+ (including iOS 27.2) fully work therefore requires two pieces of
-new reverse-engineering work in SandBlaster itself:
+What *is* already known about the modern collection, as a starting point for
+finishing the work: its strings still use SandBlaster's existing encodings —
+both the iOS 13+ plain form (a `u16` length of `len + 1` at an 8-byte-aligned
+offset, as `extract_string_from_offset` expects) and the aggregated
+shared-prefix form that `reverse-sandbox/reverse_string.py` already decodes.
+What is missing is locating the collection header, the profile table and the
+operation-node area within `__TEXT,__const`.
 
-  1. **Chained-fixup-aware extraction** — resolve arm64e chained fixups so the
-     operation-order pointer table (and other pointer tables) in the sandbox
-     KEXT can be read, to recover the ordered operations list.
-  2. **Protobox collection support** — parse the modern collection structure
-     the KEXT embeds, rather than the legacy bundle format.
-
-Until that lands, treat iOS 15+ support as acquisition-only. The reverser emits
-a warning when run against an unvalidated release, and reverses on a
-best-effort basis if it is handed a collection in the legacy bundle format.
+So on iOS 15+ (including iOS 27.2) the pipeline yields a correct, ordered
+operations list but stops before reversing. The reverser also warns when run
+against a release newer than the last validated one, and reverses on a
+best-effort basis if handed a collection in the legacy bundle format.
 
 ## Community
 
