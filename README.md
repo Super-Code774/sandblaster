@@ -61,16 +61,27 @@ cd helpers/
 ./ipsw_extract.py --kernelcache ./kernelcache.release.iPhone16,1 -o ./out
 ```
 
-Without `--reverse` the script prints the exact `reverse_sandbox.py` command to
-run next against the extracted `out/sandbox_bundle` and `out/sandbox.sb_ops`.
+Here `ipsw` is used purely for firmware plumbing — downloading / remotely
+extracting the kernelcache and carving the `com.apple.security.sandbox` KEXT
+out of it — and SandBlaster's own `extract_sandbox_data.py` then reads the
+operations list and profile collection out of that KEXT. Without `--reverse`
+the script prints the exact `reverse_sandbox.py` command to run next against
+the extracted `out/sandbox_bundle` and `out/sandbox.sb_ops`.
 
-> **Note on iOS 15+ (including iOS 27.2):** the binary sandbox format has been
-> validated up to iOS 14. Newer releases are reversed on a best-effort basis
-> using the iOS 13+ code path, and the reverser prints a warning to that
-> effect. If a collection fails to parse it may be in Apple's newer *protobox*
-> format; `ipsw sb dump --type protobox <kernelcache>` extracts that variant,
-> and the reverser's format handling should be updated once validated against
-> real firmware.
+The kernel download, remote extraction and KEXT extraction steps are validated
+against real firmware (e.g. iOS 17.0).
+
+> **Known limitation on iOS 15+ (including iOS 27.2):** the *native extractor
+> and reverser do not yet understand the modern sandbox collection.* SandBlaster
+> was built for the iOS 9–14 bundle format; on iOS 15+ the sandbox KEXT is an
+> arm64e Mach-O whose operation table is stored as chained-fixup pointers, and
+> the profile collection is Apple's newer *protobox* layout rather than the
+> classic `0x8000` bundle. `extract_sandbox_data.py` therefore cannot currently
+> recover the operations list or the collection from an iOS 15+ KEXT, so the
+> end-to-end native pipeline stops at extraction for those releases. The ipsw
+> acquisition front-end above still works; reversing modern collections needs
+> the protobox format and chained-fixup handling to be implemented (see the
+> "Supported iOS Versions" section).
 
 ### Legacy firmware (iOS ≤ 12)
 
@@ -146,14 +157,31 @@ stored in a bundle, since iOS 10 strings are aggregated together in a
 specialized binary format, and iOS 13 reworked the collection header. The
 format has been validated up to **iOS 14**.
 
-iOS 15 through **iOS 27** are supported on a best-effort basis: they reuse the
-iOS 13+ binary-format code path and the iOS 14 filter table, and the reverser
-emits a warning when reversing an unvalidated release. Use
-`helpers/ipsw_extract.py` to acquire and extract the kernel for these releases.
-On recent firmware Apple also ships the sandbox collection in a newer
-*protobox* format; if the native reverser cannot parse a collection, dump that
-variant with `ipsw sb dump --type protobox <kernelcache>` and update the
-format handling accordingly.
+iOS 15 through **iOS 27** are **partially** supported:
+
+  * **Acquisition works.** `helpers/ipsw_extract.py` uses `ipsw` to download or
+    remotely extract the kernelcache and carve out the
+    `com.apple.security.sandbox` KEXT. This is validated against real firmware.
+  * **Native extraction/reversing does not work yet.** Starting around iOS 15,
+    the sandbox KEXT is an arm64e Mach-O whose operation-name table is stored
+    as chained-fixup pointers (so SandBlaster's plain-pointer table scan finds
+    nothing), and the compiled profile collection uses Apple's newer *protobox*
+    layout instead of the classic `0x8000` bundle. `extract_sandbox_data.py`
+    and `reverse_sandbox.py` were written for the iOS 9–14 format and do not
+    recognize either of these yet.
+
+Making iOS 15+ (including iOS 27.2) fully work therefore requires two pieces of
+new reverse-engineering work in SandBlaster itself:
+
+  1. **Chained-fixup-aware extraction** — resolve arm64e chained fixups so the
+     operation-order pointer table (and other pointer tables) in the sandbox
+     KEXT can be read, to recover the ordered operations list.
+  2. **Protobox collection support** — parse the modern collection structure
+     the KEXT embeds, rather than the legacy bundle format.
+
+Until that lands, treat iOS 15+ support as acquisition-only. The reverser emits
+a warning when run against an unvalidated release, and reverses on a
+best-effort basis if it is handed a collection in the legacy bundle format.
 
 ## Community
 

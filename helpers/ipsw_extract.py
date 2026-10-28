@@ -15,11 +15,18 @@ us: it can download the kernel directly, extract it straight out of a remote
 IPSW without downloading the whole archive, and dump the raw sandbox blobs
 (the operations list and the sandbox collection) from a kernelcache.
 
-This script drives ``ipsw`` to produce exactly the two inputs the SandBlaster
-reverser (``reverse-sandbox/reverse_sandbox.py``) consumes:
+This script uses ``ipsw`` only for the firmware plumbing -- downloading or
+remotely extracting the kernelcache and carving the
+``com.apple.security.sandbox`` kernel extension out of it -- and then hands
+that extension to SandBlaster's own ``extract_sandbox_data.py`` to produce the
+two inputs the reverser (``reverse-sandbox/reverse_sandbox.py``) consumes:
 
   * a ``*.sb_ops`` file  -- the newline separated sandbox operations list;
   * a ``sandbox_bundle`` file -- the raw binary sandbox profile collection.
+
+Keeping the sandbox carving in SandBlaster's native extractor (rather than in
+``ipsw``) is deliberate: ``ipsw`` handles the kernel download/extraction, and
+SandBlaster stays responsible for understanding the sandbox binary format.
 
 Example (download the kernel for a device/version, then extract)::
 
@@ -43,7 +50,6 @@ only shells out to it; it has no third-party Python dependencies.
 
 import argparse
 import glob
-import json
 import os
 import shutil
 import subprocess
@@ -165,99 +171,86 @@ def acquire_kernelcache(args):
     return kernelcache
 
 
-def extract_operations(kernelcache, out_path):
-    """Extract the sandbox operations list from ``kernelcache``.
+def extract_sandbox_kext(kernelcache, out_dir, kext):
+    """Carve the sandbox kernel extension out of ``kernelcache`` with ipsw.
 
-    ``ipsw sb opts`` prints the ordered list of sandbox operations compiled
-    into the kernel. The ordering matters: the reverser indexes the profile
-    operation table by position, so this list must be written out in the exact
-    order ``ipsw`` reports it. We prefer the ``--json`` output (a plain array
-    of operation names) and fall back to parsing one-operation-per-line text.
-
-    Args:
-        kernelcache: path to the kernelcache.
-        out_path: file to write the operations list to.
-
-    Returns:
-        The number of operations written.
-    """
-    ops = None
-    try:
-        raw = run_ipsw(["sb", "opts", "--json", kernelcache], capture=True)
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            ops = [str(o) for o in parsed]
-        elif isinstance(parsed, dict):
-            # Some ipsw versions wrap the array, e.g. {"operations": [...]}.
-            for value in parsed.values():
-                if isinstance(value, list):
-                    ops = [str(o) for o in value]
-                    break
-    except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError):
-        ops = None
-
-    if ops is None:
-        # Fall back to plain-text output, one operation per line.
-        raw = run_ipsw(["sb", "opts", kernelcache], capture=True)
-        ops = [line.strip() for line in raw.splitlines() if line.strip()]
-
-    if not ops:
-        eprint("error: could not extract any sandbox operations.")
-        sys.exit(1)
-
-    with open(out_path, "w") as handle:
-        handle.write("\n".join(ops) + "\n")
-    eprint("wrote %d sandbox operations to %s" % (len(ops), out_path))
-    return len(ops)
-
-
-def extract_collection(kernelcache, out_dir, out_path):
-    """Dump the raw sandbox collection blob from ``kernelcache``.
-
-    ``ipsw sb dump`` writes the raw sandbox blobs (the operations table, the
-    individual profiles and the collection/protobox) to disk. The reverser
-    wants the whole collection, so once ``ipsw`` has written its blobs we look
-    for the collection file and copy it to ``out_path`` under the conventional
-    ``sandbox_bundle`` name the reverser documentation uses.
+    ``ipsw kernel extract <KERNELCACHE> <KEXT>`` writes the named KEXT as a
+    standalone Mach-O into the output directory. The sandbox operations table
+    and the binary profile collection both live inside this extension, which is
+    exactly what SandBlaster's native extractor expects as input.
 
     Args:
         kernelcache: path to the kernelcache.
-        out_dir: directory ipsw should dump its blobs into.
-        out_path: final path for the sandbox collection blob.
+        out_dir: directory ipsw should write the KEXT into.
+        kext: KEXT bundle identifier to extract
+            (default ``com.apple.security.sandbox``).
 
     Returns:
-        The path to the sandbox collection blob.
+        The path to the extracted sandbox KEXT Mach-O.
     """
     before = set(glob.glob(os.path.join(out_dir, "*")))
-    run_ipsw(["sb", "dump", kernelcache, "--output", out_dir])
+    run_ipsw(["kernel", "extract", kernelcache, kext,
+              "--output", out_dir, "--force"])
     after = set(glob.glob(os.path.join(out_dir, "*")))
-    produced = after - before
+    produced = [p for p in (after - before) if os.path.isfile(p)]
 
-    # Identify the collection blob among whatever ipsw produced. The collection
-    # is the aggregate bundle of every profile; prefer a file that advertises
-    # itself as the collection, then a generic sandbox blob.
-    def score(path):
-        name = os.path.basename(path).lower()
-        if "collection" in name:
-            return 0
-        if "protobox" in name:
-            return 1
-        if "sandbox" in name:
-            return 2
-        return 3
+    # ipsw names the extracted file after the bundle id (optionally with an
+    # arch suffix). Prefer a freshly produced file that mentions "sandbox";
+    # fall back to scanning the directory in case the file already existed.
+    def looks_like_sandbox(path):
+        return "sandbox" in os.path.basename(path).lower()
 
-    blobs = sorted((p for p in produced if os.path.isfile(p)), key=score)
-    if not blobs:
-        eprint("error: `ipsw sb dump` did not produce any blob files in %s"
-               % out_dir)
+    candidates = [p for p in produced if looks_like_sandbox(p)] or produced
+    if not candidates:
+        candidates = [p for p in glob.glob(os.path.join(out_dir, "*"))
+                      if os.path.isfile(p) and looks_like_sandbox(p)]
+    if not candidates:
+        eprint("error: `ipsw kernel extract` did not produce the %s KEXT in %s"
+               % (kext, out_dir))
+        eprint("       run `ipsw kernel kexts %s` to list available KEXT ids."
+               % kernelcache)
         sys.exit(1)
 
-    collection = blobs[0]
-    if os.path.abspath(collection) != os.path.abspath(out_path):
-        shutil.copyfile(collection, out_path)
-    eprint("wrote sandbox collection to %s (from %s)"
-           % (out_path, os.path.basename(collection)))
-    return out_path
+    kext_path = candidates[0]
+    eprint("extracted sandbox KEXT: %s" % kext_path)
+    return kext_path
+
+
+def native_extract(kext_path, ops_path, bundle_dir, release):
+    """Run SandBlaster's native extractor on the sandbox KEXT.
+
+    ``extract_sandbox_data.py`` parses the KEXT Mach-O with ``lief`` and writes
+    the operations list (``-o``) and the sandbox profile collection (``-O``,
+    produced as a file named ``sandbox_bundle`` for iOS 9+). This is
+    SandBlaster's own understanding of the sandbox binary format; ipsw is used
+    only to obtain the KEXT.
+
+    Args:
+        kext_path: path to the extracted sandbox KEXT.
+        ops_path: path to write the ``.sb_ops`` operations list to.
+        bundle_dir: directory the ``sandbox_bundle`` collection is written to.
+        release: iOS release string (e.g. ``27.2``); its major version selects
+            the extraction logic.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    extractor = os.path.join(here, "extract_sandbox_data.py")
+    cmd = [sys.executable, extractor,
+           "-o", ops_path,
+           "-O", bundle_dir,
+           kext_path, release]
+    eprint("+ " + " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+    bundle_path = os.path.join(bundle_dir, "sandbox_bundle")
+    if not os.path.isfile(bundle_path):
+        eprint("error: the extractor did not produce %s" % bundle_path)
+        eprint("       on modern firmware the collection may be in the newer "
+               "\"protobox\" format that the native extractor does not parse "
+               "yet.")
+        sys.exit(1)
+    eprint("wrote operations to %s and collection to %s"
+           % (ops_path, bundle_path))
+    return bundle_path
 
 
 def reverse(bundle_path, ops_path, release, out_dir):
@@ -315,34 +308,41 @@ def main():
     parser.add_argument("-p", "--prefix", metavar="NAME", default="sandbox",
                         help="basename for the generated .sb_ops file "
                              "(default: sandbox)")
+    parser.add_argument("--kext", metavar="ID",
+                        default="com.apple.security.sandbox",
+                        help="sandbox KEXT bundle id to extract "
+                             "(default: com.apple.security.sandbox)")
     parser.add_argument("--reverse", action="store_true",
                         help="after extraction, run reverse_sandbox.py on the "
                              "results")
     parser.add_argument("-r", "--release", metavar="VER",
-                        help="iOS release string passed to the reverser with "
-                             "--reverse; defaults to --version")
+                        help="iOS release string for the extractor/reverser "
+                             "(e.g. 27.2); defaults to --version")
 
     args = parser.parse_args()
 
+    # The native extractor and reverser both need an iOS release string to
+    # select their version-specific logic. It comes from --release or, when
+    # downloading, from --version.
+    release = args.release or args.version
+    if release is None:
+        parser.error("an iOS release is required: pass -r/--release "
+                     "(or --version when downloading).")
+
     if args.device and not args.version:
         eprint("note: no --version given, downloading the latest release.")
-    if args.reverse and not (args.release or args.version):
-        parser.error("--reverse needs an iOS release: pass -r/--release "
-                     "(or --version when downloading).")
 
     require_ipsw()
     os.makedirs(args.output, exist_ok=True)
 
     kernelcache = acquire_kernelcache(args)
 
-    ops_path = os.path.join(args.output, args.prefix + ".sb_ops")
-    bundle_path = os.path.join(args.output, "sandbox_bundle")
+    kext_path = extract_sandbox_kext(kernelcache, args.output, args.kext)
 
-    extract_operations(kernelcache, ops_path)
-    extract_collection(kernelcache, args.output, bundle_path)
+    ops_path = os.path.join(args.output, args.prefix + ".sb_ops")
+    bundle_path = native_extract(kext_path, ops_path, args.output, release)
 
     if args.reverse:
-        release = args.release or args.version
         reverse(bundle_path, ops_path,
                 release, os.path.join(args.output, "reversed_profiles"))
     else:
@@ -350,7 +350,7 @@ def main():
         eprint("next: reverse the extracted collection, e.g.")
         eprint("  cd ../reverse-sandbox")
         eprint("  python3 reverse_sandbox.py -r %s -o %s -d reversed %s"
-               % (args.release or args.version or "27.2",
+               % (release,
                   os.path.abspath(ops_path), os.path.abspath(bundle_path)))
 
 
