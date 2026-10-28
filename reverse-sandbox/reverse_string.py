@@ -8,6 +8,18 @@ logging.config.fileConfig("logger.config")
 logger = logging.getLogger(__name__)
 
 
+def as_text(value):
+    """Render a byte string for logging.
+
+    The strings handled here are raw bytes out of the sandbox profile, which
+    cannot be passed to a "{:s}" format directly on Python 3 and are not
+    necessarily valid ASCII.
+    """
+    if isinstance(value, bytes):
+        return value.decode("ascii", "replace")
+    return str(value)
+
+
 class ReverseStringState:
     binary_string = ""
     len = 0
@@ -146,13 +158,13 @@ class ReverseStringState:
     def read_token(self, substr_len):
         self.token_stack.append(self.token)
         self.token = self.binary_string[self.pos:self.pos+substr_len]
-        logger.debug("got token \"{:s}\"".format(self.token))
+        logger.debug("got token \"{:s}\"".format(as_text(self.token)))
         self.pos += substr_len
 
     def update_base(self):
         self.base += self.token
         self.token = ""
-        logger.debug("update base to \"{:s}\"".format(self.base))
+        logger.debug("update base to \"{:s}\"".format(as_text(self.base)))
 
     def update_base_stack(self):
         self.base_stack.append(self.base)
@@ -160,7 +172,7 @@ class ReverseStringState:
 
     def end_current_token(self):
         self.output_strings.append(self.base+self.token)
-        logger.debug("output string \"{:s}\"".format(self.base+self.token))
+        logger.debug("output string \"{:s}\"".format(as_text(self.base+self.token)))
         self.token = ""
 
     def get_last_byte(self):
@@ -175,7 +187,7 @@ class ReverseStringState:
     def end_with_subtokens(self, subtokens):
         for s in subtokens:
             self.output_strings.append(self.base+self.token+s)
-            logger.debug("output string with subtokens \"{:s}\"".format(self.base+self.token+s))
+            logger.debug("output string with subtokens \"{:s}\"".format(as_text(self.base+self.token+s)))
         self.token = ""
 
     def is_end(self):
@@ -336,7 +348,7 @@ class SandboxString:
             logger.warn("previous state ({:d})".format(rss.state_stack[len(rss.state_stack)-1]))
 
         logger.info("initial string: " + " ".join("0x{:02x}".format(ord(c)) for c in s))
-        logger.info("output_strings (num: {:d}): {:s}".format(len(rss.output_strings), ",".join('"{:s}"'.format(s) for s in rss.output_strings)))
+        logger.info("output_strings (num: {:d}): {:s}".format(len(rss.output_strings), ",".join('"{:s}"'.format(as_text(s)) for s in rss.output_strings)))
         return rss.output_strings
 
 
