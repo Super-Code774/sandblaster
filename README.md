@@ -185,13 +185,31 @@ the sandbox KEXT on modern firmware, and only the first is solved:
      its header fields are not where `reverse_sandbox.py` expects them, so the
      collection cannot be handed to the reverser yet.
 
-What *is* already known about the modern collection, as a starting point for
-finishing the work: its strings still use SandBlaster's existing encodings —
-both the iOS 13+ plain form (a `u16` length of `len + 1` at an 8-byte-aligned
-offset, as `extract_string_from_offset` expects) and the aggregated
-shared-prefix form that `reverse-sandbox/reverse_string.py` already decodes.
-What is missing is locating the collection header, the profile table and the
-operation-node area within `__TEXT,__const`.
+What is known about the modern collection, as a starting point for finishing
+the work (established against the iOS 27.2 iPhone16,1 KEXT):
+
+  * **The leaf encodings are unchanged.** Strings still use both forms
+    SandBlaster already implements: the iOS 13+ plain form (a `u16` length of
+    `len + 1` at an 8-byte-aligned offset, exactly as
+    `extract_string_from_offset` expects) and the aggregated shared-prefix form
+    that `reverse-sandbox/reverse_string.py` decodes. Regexes still use the
+    iOS 13 structure (`u16 size`, big-endian `u32 version == 3`,
+    `size == sub_size + 6`); 261 such structures are present, interleaved with
+    the strings in one 8-byte-indexed data area starting around `0x16b18` in
+    `__TEXT,__const`.
+  * **The index structures were reorganized.** The following were tested and
+    ruled out, so they are dead ends: the `0x8000` bundle magic; the iOS 13/14
+    header field layout (with both `u16` and `u32` count fields, including
+    solving for the collection start from the data-area address); and a profile
+    table of `(2 + sb_ops_count) * 2` stride with monotonically increasing
+    `name_offset` values, for `sb_ops_count` of 198, 209, 210 and 211.
+
+In other words the bytes the reverser ultimately decodes are still in formats
+it understands; what is missing is the collection header, the profile table and
+the operation-node area that index them. The reliable way to pin those down is
+to disassemble the sandbox KEXT's collection-initialization code (the KEXT ships
+with an empty symtab, so this means working from string cross-references) rather
+than to keep pattern-matching the blob.
 
 So on iOS 15+ (including iOS 27.2) the pipeline yields a correct, ordered
 operations list but stops before reversing. The reverser also warns when run
