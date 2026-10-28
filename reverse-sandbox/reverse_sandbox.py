@@ -25,6 +25,13 @@ import sandbox_regex
 logging.config.fileConfig("logger.config")
 logger = logging.getLogger(__name__)
 
+# Newest major iOS release whose binary sandbox format has been validated
+# against real firmware. Releases from 13 onwards share the same collection
+# layout, so newer majors (15 .. 27+) are parsed with the iOS 13+ code path.
+# This is best-effort for unvalidated releases: see warn_if_unvalidated().
+LAST_VALIDATED_MAJOR = 14
+LATEST_MAJOR = 27
+
 
 def extract_string_from_offset(f, offset, ios_version):
     """Extract string (literal) from given offset."""
@@ -133,6 +140,31 @@ def is_ios_more_than_10_release(release):
     if major_version < 10:
         return False
     return True
+
+
+def warn_if_unvalidated(release):
+    """Warn when reversing a release newer than the last validated one.
+
+    SandBlaster's binary-format handling has been validated up to
+    LAST_VALIDATED_MAJOR. Newer releases (iOS 15 .. 27) are parsed with the
+    iOS 13+ code path on a best-effort basis. This keeps the tool usable for
+    new firmware while being honest that the layout has not been confirmed.
+    """
+    major = get_ios_major_version(release)
+    if major > LAST_VALIDATED_MAJOR:
+        logger.warning(
+            "iOS %d has not been validated; using the iOS 13+ format path "
+            "(last validated: iOS %d).", major, LAST_VALIDATED_MAJOR)
+        print(
+            "warning: iOS %d is newer than the last validated release "
+            "(iOS %d).\n"
+            "         Reversing with the iOS 13+ binary-format path on a "
+            "best-effort basis.\n"
+            "         If the collection fails to parse it may be in the "
+            "newer \"protobox\" format; extract it with\n"
+            "         `ipsw sb dump --type protobox <kernelcache>` and file "
+            "the format details upstream."
+            % (major, LAST_VALIDATED_MAJOR), file=sys.stderr)
 
 
 def display_sandbox_profiles(f, re_table_offset, num_sb_ops, ios_version):
@@ -257,7 +289,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("filename", help="path to the binary sandbox profile")
-    parser.add_argument("-r", "--release", help="iOS release version for sandbox profile", required=True)
+    parser.add_argument("-r", "--release", help="iOS release version for sandbox profile (supported: 4 - 27)", required=True)
     parser.add_argument("-o", "--operations_file", help="file with list of operations", required=True)
     parser.add_argument("-p", "--profile", nargs='+', help="profile to reverse (for bundles) (default is to reverse all operations)")
     parser.add_argument("-n", "--operation", nargs='+', help="particular operation(s) to reverse (default is to reverse all operations)")
@@ -271,6 +303,8 @@ def main():
         parser.print_usage()
         print("no sandbox profile/bundle file to reverse")
         sys.exit(1)
+
+    warn_if_unvalidated(args.release)
 
     # Read sandbox operations.
     sb_ops = [l.strip() for l in open(args.operations_file)]

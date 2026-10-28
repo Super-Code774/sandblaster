@@ -14,20 +14,78 @@ iExtractor is open source software released under the 3-clause BSD license.
 
 ## Installation
 
-SandBlaster requires Python2 for the reverser (in `reverse-sandbox/`), Python3 with `lief` library for helper script (in `helpers/`).
+SandBlaster runs on Python 3. The reverser (in `reverse-sandbox/`) has no
+third-party dependencies. The two extraction front-ends in `helpers/` have
+different needs:
 
-After cloning the SandBlaster repository, you have to install `lief` for Python3:
-```
-pip3 install lief
-```
-
-If the installation of `lief` fails you need compile to it. More information about how to compile it can be found on the [wiki page](https://lief.quarkslab.com/doc/stable/compilation.html).
+  * `helpers/ipsw_extract.py` (recommended, modern firmware) drives
+    [`ipsw`](https://github.com/blacktop/ipsw) and needs it on `$PATH`:
+    ```
+    # macOS
+    brew install blacktop/tap/ipsw
+    # Linux: see https://github.com/blacktop/ipsw#install
+    ```
+  * `helpers/extract_sandbox_data.py` (legacy path, iOS ≤ 12) parses Mach-O
+    binaries directly with `lief`:
+    ```
+    pip3 install lief
+    ```
+    If the installation of `lief` fails you need to compile it. More
+    information about how to compile it can be found on the
+    [wiki page](https://lief.quarkslab.com/doc/stable/compilation.html).
 
 ## Usage
 
-In order to use SandBlaster you need access to the binary sandbox profiles and the sandbox operations, a set of strings that define sandbox-specific actions. Sandbox operations and sandbox profiles are extracted using the `helpers/extract_sandbox_data.py` script. Sandbox profiles are extracted from the kernel sandbox extension (as a bundle for iOS 4 and 9-11) or from kernel cache (as a bundle for iOS 12) or from the `sandboxd` file in the iOS filesystem (for iOS 5-8). Sandbox operations are extracted either from kernel extension (for iOS 4-11) or from kernel cache (for iOS 12).
+In order to use SandBlaster you need access to the binary sandbox profiles and
+the sandbox operations, a set of strings that define sandbox-specific actions.
 
-So, as input data, SandBlaster requires the kernelcache, the kernel sandbox extension and the `sandboxd` file. Information and scripts on extracting them from a publicly available IPSW (*iPhone Software*) file is presented by [iExtractor](https://github.com/malus-security/iExtractor).
+### Modern firmware with `ipsw` (iOS 13+, including iOS 27.2)
+
+On current iOS the sandbox collection and the operations list live inside the
+`com.apple.security.sandbox` extension of the (fileset) kernelcache.
+`helpers/ipsw_extract.py` uses [`ipsw`](https://github.com/blacktop/ipsw) to
+download the kernel (or extract it remotely from an IPSW URL without
+downloading the whole archive) and to carve out the two inputs the reverser
+consumes: a `*.sb_ops` operations file and a `sandbox_bundle` collection blob.
+
+```
+cd helpers/
+
+# Download the kernel for a device/version, extract, and reverse in one go.
+./ipsw_extract.py --device iPhone16,1 --version 27.2 -o ./out --reverse -r 27.2
+
+# Or extract the kernel remotely from an IPSW URL (no full download).
+./ipsw_extract.py --url https://.../iPhone16,1_27.2_Restore.ipsw -o ./out
+
+# Or reuse a kernelcache you already have on disk.
+./ipsw_extract.py --kernelcache ./kernelcache.release.iPhone16,1 -o ./out
+```
+
+Without `--reverse` the script prints the exact `reverse_sandbox.py` command to
+run next against the extracted `out/sandbox_bundle` and `out/sandbox.sb_ops`.
+
+> **Note on iOS 15+ (including iOS 27.2):** the binary sandbox format has been
+> validated up to iOS 14. Newer releases are reversed on a best-effort basis
+> using the iOS 13+ code path, and the reverser prints a warning to that
+> effect. If a collection fails to parse it may be in Apple's newer *protobox*
+> format; `ipsw sb dump --type protobox <kernelcache>` extracts that variant,
+> and the reverser's format handling should be updated once validated against
+> real firmware.
+
+### Legacy firmware (iOS ≤ 12)
+
+Sandbox operations and sandbox profiles can also be extracted using the
+`helpers/extract_sandbox_data.py` script, which parses Mach-O binaries with
+`lief`. Sandbox profiles are extracted from the kernel sandbox extension (as a
+bundle for iOS 4 and 9-11) or from kernel cache (as a bundle for iOS 12) or
+from the `sandboxd` file in the iOS filesystem (for iOS 5-8). Sandbox
+operations are extracted either from kernel extension (for iOS 4-11) or from
+kernel cache (for iOS 12).
+
+So, as input data, this legacy path requires the kernelcache, the kernel
+sandbox extension and the `sandboxd` file. Information and scripts on
+extracting them from a publicly available IPSW (*iPhone Software*) file is
+presented by [iExtractor](https://github.com/malus-security/iExtractor).
 
 Below are the steps and commands to reverse the sandbox profiles for iOS 8.4.1, assuming the sandbox kernel extension (`com.apple.security.sandbox.kext`) and the `sandboxd` file are available:
 
@@ -82,7 +140,20 @@ The actual reverser is part of the `reverse-sandbox/` folder. Files here can be 
 
 ## Supported iOS Versions
 
-SandBlaster works for iOS version 4 onwards including iOS 12. Apple has been making updates to the binary format of the sandbox profiles: since iOS 9 sandbox profiles are stored in a bundle, since iOS 10 strings are aggregated together in a specialied binary format. iOS 11 didn't bring any change to the format.
+SandBlaster works for iOS version 4 onwards. Apple has been making updates to
+the binary format of the sandbox profiles: since iOS 9 sandbox profiles are
+stored in a bundle, since iOS 10 strings are aggregated together in a
+specialized binary format, and iOS 13 reworked the collection header. The
+format has been validated up to **iOS 14**.
+
+iOS 15 through **iOS 27** are supported on a best-effort basis: they reuse the
+iOS 13+ binary-format code path and the iOS 14 filter table, and the reverser
+emits a warning when reversing an unvalidated release. Use
+`helpers/ipsw_extract.py` to acquire and extract the kernel for these releases.
+On recent firmware Apple also ships the sandbox collection in a newer
+*protobox* format; if the native reverser cannot parse a collection, dump that
+variant with `ipsw sb dump --type protobox <kernelcache>` and update the
+format handling accordingly.
 
 ## Community
 

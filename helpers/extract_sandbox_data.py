@@ -676,12 +676,15 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Sandbox profiles and operations extraction tool(iOS <9)')
+        description='Sandbox profiles and operations extraction tool. '
+                    'Legacy lief-based path; for modern firmware (iOS 13+, '
+                    'incl. iOS 27) prefer ipsw_extract.py, which drives ipsw '
+                    'to download and extract the kernel.')
     parser.add_argument('binary', metavar='BINARY', type=lief.MachO.parse,
                         help='path to sandbox(seatbelt) kernel exenstion' +
-                        '(iOS 4-12) in order to extract sandbox operations OR ' +
+                        '(iOS 4+) in order to extract sandbox operations OR ' +
                         'path to sandboxd(iOS 5-8) / sandbox(seatbelt) kernel extension' +
-                        '(iOS 4 and 9-12) in order to extract sandbox profiles')
+                        '(iOS 4 and 9+) in order to extract sandbox profiles')
     parser.add_argument('version', metavar='VERSION',
                         type=get_ios_major_version, help='iOS version for given binary')
     parser.add_argument('-o', '--output-sbops', dest='sbops_file', type=str,
