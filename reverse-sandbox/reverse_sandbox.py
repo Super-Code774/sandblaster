@@ -32,6 +32,93 @@ logger = logging.getLogger(__name__)
 LAST_VALIDATED_MAJOR = 14
 LATEST_MAJOR = 27
 
+# --- Modern collection format (iOS 15+, format version byte 0xCC) -----------
+#
+# Recovered from the sandbox KEXT's own collection_init() on iOS 27.2. The
+# header is byte-oriented rather than the u16 layout used up to iOS 14:
+#
+#   +0x0  u16  magic (0x8000)
+#   +0x2  u16  operation node count
+#   +0x4  u8   format version (0xCC)
+#   +0x5  u8   global variable count
+#   +0x6  u8   profile flag count
+#   +0x7  u8   base ("common") profile count
+#   +0x8  u8   state flag count
+#   +0x9  u8   unused
+#   +0xa  u16  profile count
+#   +0xc  u16  regex count
+#   +0xe  u16  auxiliary table count
+#
+# Six u16 tables follow at 0x10 in this order: regexes, global variables,
+# profile flags, base profiles, state flags, auxiliary. The profile array
+# follows, then the operation nodes, then the string/regex data area that
+# every table offset indexes (as base_addr + offset * 8).
+MODERN_FORMAT_VERSION = 0xCC
+
+# The kernel hardcodes the profile entry size, so SandBlaster does too. Each
+# entry is four u16 fields (name offset, flags, and two more) followed by the
+# per-operation node offset table, hence 416 / 2 - 4 = 204 operations.
+MODERN_PROFILE_ENTRY_SIZE = 416
+MODERN_PROFILE_OP_TABLE_OFFSET = 8
+
+
+def is_modern_format(f):
+    """Return True when the file is a modern (0xCC) sandbox collection."""
+    pos = f.tell()
+    f.seek(4)
+    version = f.read(1)
+    f.seek(pos)
+    return len(version) == 1 and version[0] == MODERN_FORMAT_VERSION
+
+
+def parse_modern_header(f):
+    """Parse a modern sandbox collection header into a dict of counts/offsets.
+
+    Args:
+        f: open binary collection file.
+
+    Returns:
+        A dict describing the collection layout.
+    """
+    f.seek(0)
+    hdr = f.read(0x10)
+
+    counts = {
+        "magic": struct.unpack("<H", hdr[0:2])[0],
+        "op_nodes_count": struct.unpack("<H", hdr[2:4])[0],
+        "version": hdr[4],
+        "global_count": hdr[5],
+        "profile_flag_count": hdr[6],
+        "base_profile_count": hdr[7],
+        "state_flag_count": hdr[8],
+        "profiles_count": struct.unpack("<H", hdr[10:12])[0],
+        "regex_count": struct.unpack("<H", hdr[12:14])[0],
+        "aux_count": struct.unpack("<H", hdr[14:16])[0],
+    }
+
+    # The six u16 tables, in file order.
+    offset = 0x10
+    for name, key in (("regex_table", "regex_count"),
+                      ("global_table", "global_count"),
+                      ("profile_flag_table", "profile_flag_count"),
+                      ("base_profile_table", "base_profile_count"),
+                      ("state_flag_table", "state_flag_count"),
+                      ("aux_table", "aux_count")):
+        counts[name] = offset
+        offset += counts[key] * 2
+
+    counts["profile_table"] = offset
+    end = offset + counts["profiles_count"] * MODERN_PROFILE_ENTRY_SIZE
+    # The kernel rounds the end of the profile array up to an 8 byte boundary
+    # using the (unaligned) low bits of the profile table offset.
+    if offset & 6:
+        end = end - (offset & 6) + 8
+    counts["op_nodes_offset"] = end
+    counts["base_addr"] = end + counts["op_nodes_count"] * 8
+    counts["num_sb_ops"] = \
+        MODERN_PROFILE_ENTRY_SIZE // 2 - MODERN_PROFILE_OP_TABLE_OFFSET // 2
+    return counts
+
 
 def extract_string_from_offset(f, offset, ios_version):
     """Extract string (literal) from given offset."""
@@ -243,10 +330,14 @@ def get_global_vars(f, vars_offset, num_vars, base_offset):
             len = struct.unpack("<I", f.read(4))[0]
         s = f.read(len-1)
         global_vars.append(s)
-    logger.info("global variables are {:s}".format(", ".join(s for s in global_vars)))
+    logger.info("global variables are {:s}".format(", ".join(
+        s.decode("ascii", "replace") if isinstance(s, bytes) else str(s)
+        for s in global_vars)))
     return global_vars
 
 def get_base_addr(f, ios_version):
+    if ios_version >= 15 and is_modern_format(f):
+        return parse_modern_header(f)["base_addr"]
     if ios_version >= 13:
         # extract operation node table count
         f.seek(2)
@@ -327,21 +418,51 @@ def main():
 
     f = open(args.filename, "rb")
 
-    if get_ios_major_version(args.release) >= 6:
+    ios_major = get_ios_major_version(args.release)
+
+    # Modern (iOS 15+) collections use a different header and table layout.
+    modern = None
+    if ios_major >= 15 and is_modern_format(f):
+        modern = parse_modern_header(f)
+        logger.info("modern collection (format 0x%x): %d profiles, %d operation "
+                    "nodes, %d regexes, %d operations, base_addr 0x%x",
+                    modern["version"], modern["profiles_count"],
+                    modern["op_nodes_count"], modern["regex_count"],
+                    modern["num_sb_ops"], modern["base_addr"])
+        # The KEXT's operation name table carries more names than the
+        # collection has operations (the trailing ones are message-filter
+        # operations, a separate namespace), so keep the leading ones.
+        if num_sb_ops > modern["num_sb_ops"]:
+            logger.info("using the first %d of %d operations from %s",
+                        modern["num_sb_ops"], num_sb_ops, args.operations_file)
+            sb_ops = sb_ops[:modern["num_sb_ops"]]
+            num_sb_ops = len(sb_ops)
+        elif num_sb_ops < modern["num_sb_ops"]:
+            print("error: collection defines %d operations but %s lists only %d"
+                  % (modern["num_sb_ops"], args.operations_file, num_sb_ops),
+                  file=sys.stderr)
+            sys.exit(1)
+
+    f.seek(0)
+    if ios_major >= 6:
         header = struct.unpack("<H", f.read(2))[0]
         logger.debug("header: 0x%x", header)
     else:
         logger.debug("header: none for iOS <6; using 0")
         header = 0
 
-    if get_ios_major_version(args.release) >= 13:
-        re_table_offset = 12
+    if modern:
+        re_table_offset = modern["regex_table"]
+        re_table_count = modern["regex_count"]
     else:
-        re_table_offset = struct.unpack("<H", f.read(2))[0]
-    
-    if get_ios_major_version(args.release) >= 12:
-        f.seek(8)
-    re_table_count = struct.unpack("<H", f.read(2))[0]
+        if ios_major >= 13:
+            re_table_offset = 12
+        else:
+            re_table_offset = struct.unpack("<H", f.read(2))[0]
+
+        if ios_major >= 12:
+            f.seek(8)
+        re_table_count = struct.unpack("<H", f.read(2))[0]
 
     logger.debug("re_table_offset: 0x%x", re_table_offset)
     logger.debug("re_table_count: 0x%x", re_table_count)
@@ -382,7 +503,13 @@ def main():
     # In case of sandbox profile bundle, go through each profile.
     if header == 0x8000:
         logger.info("using profile bundle")
-        if get_ios_major_version(args.release) >= 13:
+        if modern:
+            vars_offset = modern["global_table"]
+            num_vars = modern["global_count"]
+            logger.info("{:d} global vars at offset 0x{:0x}".format(num_vars, vars_offset))
+            global_vars = get_global_vars(f, vars_offset, num_vars,
+                                          modern["base_addr"])
+        elif get_ios_major_version(args.release) >= 13:
             # get the regex table entries
             f.seek(8)
             regex_table_count = struct.unpack('<H', f.read(2))[0]
@@ -409,10 +536,17 @@ def main():
             f.seek(10)
         else:
             f.seek(6)
-        num_profiles = struct.unpack("<H", f.read(2))[0]
+
+        if modern:
+            num_profiles = modern["profiles_count"]
+        else:
+            num_profiles = struct.unpack("<H", f.read(2))[0]
         logger.info("number of profiles in bundle: %d", num_profiles)
 
-        if get_ios_major_version(args.release) >= 13:
+        if modern:
+            num_operation_nodes = modern["op_nodes_count"]
+            f.seek(modern["op_nodes_offset"])
+        elif get_ios_major_version(args.release) >= 13:
             f.seek(2)
             num_operation_nodes = struct.unpack("<H", f.read(2))[0]
             f.seek(get_base_addr(f, get_ios_major_version(args.release)) - num_operation_nodes*8)
@@ -439,7 +573,9 @@ def main():
             args.keep_builtin_filters, global_vars)
 
         for i in range(0, num_profiles):
-            if get_ios_major_version(args.release) >= 13:
+            if modern:
+                f.seek(modern["profile_table"] + MODERN_PROFILE_ENTRY_SIZE * i)
+            elif get_ios_major_version(args.release) >= 13:
                 f.seek(8)
                 regex_table_count = struct.unpack('<H', f.read(2))[0]
                 f.seek(10)
@@ -466,7 +602,10 @@ def main():
                     continue
             logger.info("profile name (offset 0x%x): %s" % (name_offset, name))
 
-            if get_ios_major_version(args.release) >= 13:
+            if modern:
+                f.seek(modern["profile_table"] + MODERN_PROFILE_ENTRY_SIZE * i
+                       + MODERN_PROFILE_OP_TABLE_OFFSET)
+            elif get_ios_major_version(args.release) >= 13:
                 f.seek(8)
                 regex_table_count = struct.unpack('<H', f.read(2))[0]
                 f.seek(10)

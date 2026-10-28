@@ -426,7 +426,7 @@ class OperationNode():
         return self.raw == other.raw
 
     def __hash__(self):
-        return struct.unpack('<I', ''.join([chr(v) for v in self.raw[:4]]))[0]
+        return struct.unpack('<I', bytes(self.raw[:4]))[0]
 
 
 # Operation nodes processed so far.
