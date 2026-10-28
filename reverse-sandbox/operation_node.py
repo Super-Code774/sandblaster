@@ -446,7 +446,7 @@ def has_been_processed(node):
 
 def build_operation_node(raw, offset, ios_major_version):
     global operations_offset
-    node = OperationNode((offset - operations_offset) / 8) # why offset / 8 ?
+    node = OperationNode((offset - operations_offset) // 8) # why offset / 8 ?
     node.raw = raw
     node.parse_raw(ios_major_version)
     return node

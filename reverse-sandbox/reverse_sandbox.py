@@ -285,7 +285,7 @@ def display_sandbox_profiles(f, re_table_offset, num_sb_ops, ios_version):
                 break
         start = f.tell()
         end = re_table_offset * 8
-        num_operation_nodes = (end - start) / 8
+        num_operation_nodes = (end - start) // 8
 
     logger.info("number of operation nodes: %u" % num_operation_nodes)
 
@@ -565,7 +565,7 @@ def main():
                     break
             start = f.tell()
             end = re_table_offset * 8
-            num_operation_nodes = (end - start) / 8
+            num_operation_nodes = (end - start) // 8
         logger.info("number of operation nodes: %u" % num_operation_nodes)
 
         operation_nodes = create_operation_nodes(f, regex_list,
@@ -662,7 +662,7 @@ def main():
                 break
         start = f.tell()
         end = re_table_offset * 8
-        num_operation_nodes = (end - start) / 8
+        num_operation_nodes = (end - start) // 8
         logger.info("number of operation nodes: %d ; start: %#x" % (num_operation_nodes, start))
 
         operation_nodes = create_operation_nodes(f, regex_list,
